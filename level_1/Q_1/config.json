@@ -1,0 +1,11 @@
+{
+    "paths": {
+        "input_folder": "D:/Chandana/Technical_task/level_1/input_images",
+        "output_folder": "output"
+    },
+
+    "parameters": {
+        "alpha": 2.0,
+        "beta": 10
+    }
+}
