@@ -1,121 +1,124 @@
 import cv2
 import numpy as np
 import os
+import glob 
 import json
-import glob
 import csv
 
+def load_config(config_path):
+    with open(config_path) as f:
+        CONFIG = json.load(f)
+    
+    return CONFIG
 
-def load_config(config_path="config.json"):
-    with open(config_path, "r") as f:
-        return json.load(f)
+def get_class_names(names):
+    with open(names, "r") as f: 
+        classes = [line.strip() for line in f.readlines()] 
+    return classes
 
-
-def load_model(cfg_path, weights_path, use_gpu=False):
-    net = cv2.dnn.readNetFromDarknet(cfg_path, weights_path)
+def load_model(cfg_path,weights_path,use_gpu=True):
+    model = cv2.dnn.readNetFromDarknet(cfg_path,weights_path)
+    output_layers = model.getUnconnectedOutLayersNames()
+    
     if use_gpu:
-        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        model.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+        model.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
     else:
-        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    layer_names = net.getLayerNames()
-    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
-    return net, output_layers
+        model.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+        model.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
+    return model, output_layers
 
-def extract_features(net, img, input_size, feature_layer="conv_105"):
-    blob = cv2.dnn.blobFromImage(img, 1/255.0, tuple(input_size), swapRB=True, crop=False)
-    net.setInput(blob)
-    features = net.forward(feature_layer)
-    return features.flatten()
+def forward_pass(model, output_layers, img, input_size, scale=1/255, feature_layer="conv_105"):
+    blob = cv2.dnn.blobFromImage(img, scale, input_size, swapRB=True, crop=False)
+    model.setInput(blob)
+    
+    requested = [feature_layer] + list(output_layers)
+    results   = model.forward(requested)
+    
+    features       = results[0].flatten()
+    detection_outs = results[1:]
+    
+    return features, detection_outs
 
-
-def run_inference(net, output_layers, img, input_size):
-    h, w = img.shape[:2]
-    blob = cv2.dnn.blobFromImage(img, 1/255.0, tuple(input_size), swapRB=True, crop=False)
-    net.setInput(blob)
-    return net.forward(output_layers), h, w
-
-
-def parse_detections(outputs, h, w, conf_thresh):
-    boxes, confidences, class_ids = [], [], []
-    for output in outputs:
-        for det in output:
-            scores = det[5:]
-            cid = int(np.argmax(scores))
-            conf = float(scores[cid])
-            if conf < conf_thresh:
-                continue
-            cx, cy, bw, bh = det[:4]
-            x = int((cx - bw / 2) * w)
-            y = int((cy - bh / 2) * h)
-            boxes.append([x, y, int(bw * w), int(bh * h)])
-            confidences.append(conf)
-            class_ids.append(cid)
-    return boxes, confidences, class_ids
-
-
+def parse_detections(detection_outs, h, w, conf_thresh):
+    output   = np.vstack(detection_outs) 
+    scores   = output[:, 5:] 
+    classids = np.argmax(scores, axis=1)
+    confs    = scores[np.arange(len(scores)), classids]
+    
+    mask        = confs > conf_thresh
+    confidences = confs[mask]
+    classids    = classids[mask]
+    
+    cx = output[:, 0] 
+    cy = output[:, 1] 
+    bw = output[:, 2] 
+    bh = output[:, 3] 
+    
+    cx_px = (output[:, 0] * w).astype(int) 
+    cy_px = (output[:, 1] * h).astype(int)   
+    
+    bw_px = (bw * w).astype(int)   
+    bh_px = (bh * h).astype(int)
+    
+    x = cx_px - bw_px // 2
+    y = cy_px - bh_px // 2
+    
+    boxes = np.column_stack([x, y, bw_px, bh_px])[mask]
+    
+    return boxes, confidences, classids
+    
 def draw_and_save(img, boxes, confidences, class_ids, classes, colors, conf_thresh, nms_thresh, fname, output_dir):
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, nms_thresh)
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), confidences.tolist(), conf_thresh, nms_thresh)
+    
+    # Handle both empty detections and different return types
     if len(indices) > 0:
-        for i in np.array(indices).flatten():
-            x, y, bw, bh = boxes[i]
-            color = [int(c) for c in colors[class_ids[i]]]
+        # Loop through indices (handles both flat and nested returns)
+        for i in indices.flatten() if hasattr(indices, 'flatten') else indices:
+            # If i is still a list/tuple (happens in some CV versions), grab the first element
+            idx = i[0] if isinstance(i, (list, tuple, np.ndarray)) else i
+            
+            x, y, bw, bh = boxes[idx]
+            color = [int(c) for c in colors[class_ids[idx]]]
             cv2.rectangle(img, (x, y), (x + bw, y + bh), color, 2)
-            cv2.putText(img, f"{classes[class_ids[i]]}: {confidences[i]:.2f}",
+            cv2.putText(img, f"{classes[class_ids[idx]]}: {confidences[idx]:.2f}",
                         (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    
     cv2.imwrite(os.path.join(output_dir, fname), img)
-    return indices
-
-
-def save_csv(csv_path, rows):
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["filename", "class", "confidence", "x", "y", "w", "h"])
-        writer.writerows(rows)
-
 
 def main():
-    cfg = load_config("config.json")
-    with open(cfg["model"]["names"]) as f:
-        classes = [l.strip() for l in f.readlines()]
-    colors = np.random.randint(0, 255, size=(len(classes), 3), dtype="uint8")
+    cfg     = load_config("config.json")
+    classes = get_class_names(cfg["model"]["names"])
+    colors  = np.random.default_rng(42).integers(0, 255, size=(len(classes), 3), dtype="uint8")
 
-    net, output_layers = load_model(cfg["model"]["cfg"], cfg["model"]["weights"], cfg["inference"]["use_gpu"])
+    # FIX 1: use_gpu instead of input_size
+    model, output_layers = load_model(cfg["model"]["cfg"], cfg["model"]["weights"], cfg["inference"]["use_gpu"])
 
     output_dir = cfg["paths"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
-    all_features = []
-    all_filenames = []
-    csv_rows = []
+    all_features, all_filenames, csv_rows = [], [], []
 
     for image_path in glob.glob(os.path.join(cfg["paths"]["dataset_dir"], "*.jpg")):
-        img = cv2.imread(image_path)
+        img   = cv2.imread(image_path)
         fname = os.path.basename(image_path)
+        h, w  = img.shape[:2]
 
-        features = extract_features(net, img, cfg["inference"]["input_size"])
+        features, detection_outs = forward_pass(model, output_layers, img, tuple(cfg["inference"]["input_size"]))
         all_features.append(features)
-        all_filenames.append(fname)
+        all_filenames.append(fname)  
 
-        outputs, h, w = run_inference(net, output_layers, img, cfg["inference"]["input_size"])
-        boxes, confidences, class_ids = parse_detections(outputs, h, w, cfg["inference"]["conf_thresh"])
-        indices = draw_and_save(img, boxes, confidences, class_ids, classes, colors,
-                                cfg["inference"]["conf_thresh"], cfg["inference"]["nms_thresh"], fname, output_dir)
+        boxes, confidences, class_ids = parse_detections(detection_outs, h, w, cfg["inference"]["conf_thresh"])
+        draw_and_save(img, boxes, confidences, class_ids, classes, colors,
+                      cfg["inference"]["conf_thresh"], cfg["inference"]["nms_thresh"], fname, output_dir)
 
-        if len(indices) > 0:
-            for i in np.array(indices).flatten():
-                x, y, bw, bh = boxes[i]
-                csv_rows.append([fname, classes[class_ids[i]], f"{confidences[i]:.2f}", x, y, bw, bh])
-                print(f"{fname}  {classes[class_ids[i]]}  {confidences[i]:.2f}  [{x},{y},{bw},{bh}]")
+        for i in range(len(boxes)):
+            x, y, bw, bh = boxes[i]
+            csv_rows.append([fname, classes[class_ids[i]], f"{confidences[i]:.2f}", x, y, bw, bh])
 
-    feature_matrix = np.array(all_features)
-    np.save(os.path.join(output_dir, "features.npy"), feature_matrix)
-    np.save(os.path.join(output_dir, "filenames.npy"), np.array(all_filenames))
-
-    save_csv(os.path.join(output_dir, "detections.csv"), csv_rows)
-
+    np.save(os.path.join(output_dir, "features.npy"), np.array(all_features))
+    np.save(os.path.join(output_dir, "filenames.npy"), np.array(all_filenames))  
 
 if __name__ == "__main__":
     main()
